@@ -1,9 +1,18 @@
 """
-Clona repositorios Java e executa a ferramenta CK.
+Clona um repositório (ou lê de um CSV em português) e executa a ferramenta CK.
+
+Requisitos:
+ - `git` no PATH
+ - Java + JAR do CK (defina `JAR_CK`) ou comando `ck` disponível
+
+Saída:
+ - `resumo_metricas.csv` com médias/medianas/desvios para CBO, DIT, LCOM por repositório
 """
 
 import os
 import csv
+import shutil
+import os as os_exec
 import subprocess
 import shutil as shutil_exec
 from pathlib import Path
@@ -22,17 +31,12 @@ IMPRIMIR_VARIAVEIS_E_CAMPOS = "false"
 
 
 def clonar_repositorio(nome_completo, destino):
-    """Clona um repositorio no formato owner/repo para o destino informado."""
     url = f"https://github.com/{nome_completo}.git"
     subprocess.check_call(["git", "clone", "--depth", "1", url, str(destino)])
 
 
 def executar_ck_no_caminho(caminho):
-    """Executa CK no caminho e retorna o CSV de classes gerado.
-
-    Usa o JAR apontado por `JAR_CK` quando presente; caso contrario,
-    espera o comando `ck` disponivel no PATH.
-    """
+    """Executa CK no caminho e retorna o caminho do CSV de classes gerado."""
     ck_jar = os.environ.get("JAR_CK")
     pasta_saida = Path(caminho) / PASTA_SAIDA_CK
     pasta_saida.mkdir(parents=True, exist_ok=True)
@@ -65,7 +69,7 @@ def executar_ck_no_caminho(caminho):
     if arquivo_classes.exists():
         return arquivo_classes
 
-    # Fallback: CK pode gerar arquivos com prefixo no diretorio raiz do repo.
+    # fallback: CK pode gerar arquivos com prefixo no diretorio raiz do repo
     arquivo_prefixo = Path(caminho) / f"{PASTA_SAIDA_CK}{ARQUIVO_CK_CLASSE}"
     if arquivo_prefixo.exists():
         return arquivo_prefixo
@@ -74,11 +78,7 @@ def executar_ck_no_caminho(caminho):
 
 
 def agregar_csv_ck(caminho_csv):
-    """Agrega o CSV do CK e retorna estatisticas por metrica.
-
-    Retorna um dicionario com media, mediana e desvio padrao
-    populacional para CBO, DIT e LCOM.
-    """
+    """Agrega o CSV do CK e retorna dicionário com media/mediana/desvio para CBO, DIT, LCOM."""
     import statistics
     with open(caminho_csv, newline='', encoding='utf-8') as f:
         reader = csv.DictReader(f)
@@ -112,3 +112,53 @@ def agregar_csv_ck(caminho_csv):
         "DIT_media": estatisticas(dit_vals)[0], "DIT_mediana": estatisticas(dit_vals)[1], "DIT_desvio": estatisticas(dit_vals)[2],
         "LCOM_media": estatisticas(lcom_vals)[0], "LCOM_mediana": estatisticas(lcom_vals)[1], "LCOM_desvio": estatisticas(lcom_vals)[2],
     }
+
+
+def escrever_resumo_saida(arquivo_saida, nome_repo, stats):
+    existe = Path(arquivo_saida).exists()
+    with open(arquivo_saida, 'a', newline='', encoding='utf-8') as f:
+        fieldnames = ["repositorio","CBO_media","CBO_mediana","CBO_desvio","DIT_media","DIT_mediana","DIT_desvio","LCOM_media","LCOM_mediana","LCOM_desvio"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not existe:
+            writer.writeheader()
+        linha = {"repositorio": nome_repo}
+        linha.update({k: stats.get(k, "") for k in fieldnames if k != "repositorio"})
+        writer.writerow(linha)
+
+
+def processar_repositorio(nome_repo, arquivo_saida=SAIDA_SUMARIO):
+    """Clona, executa CK e grava o resumo para o repositório informado."""
+    PASTA_REPOS.mkdir(parents=True, exist_ok=True)
+    PASTA_CSVS.mkdir(parents=True, exist_ok=True)
+    destino = PASTA_REPOS / nome_repo.replace('/', '_')
+    if destino.exists():
+        print(f"Removendo pasta existente {destino}")
+        def _onerror(func, path, exc_info):
+            try:
+                os_exec.chmod(path, 0o700)
+                func(path)
+            except Exception:
+                pass
+        shutil.rmtree(destino, onerror=_onerror)
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Clonando {nome_repo} em {destino}")
+    clonar_repositorio(nome_repo, destino)
+
+    try:
+        csv_ck = executar_ck_no_caminho(destino)
+    except subprocess.CalledProcessError as e:
+        raise SystemExit(f"Falha ao executar CK: {e}")
+
+    estat = agregar_csv_ck(csv_ck)
+    escrever_resumo_saida(arquivo_saida, nome_repo, estat)
+    print(f"Resumo gravado em {arquivo_saida}")
+
+
+def processar_repositorio_por_csv(caminho_csv, index=0, arquivo_saida=SAIDA_SUMARIO):
+    """Lê o CSV (coluna `nome_completo`) e processa o repositório no índice fornecido."""
+    with open(caminho_csv, newline='', encoding='utf-8') as f:
+        reader = list(csv.DictReader(f))
+        if index < 0 or index >= len(reader):
+            raise SystemExit("Índice fora do intervalo no CSV")
+        nome_repo = reader[index]["nome_completo"]
+    processar_repositorio(nome_repo, arquivo_saida=arquivo_saida)
