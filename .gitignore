@@ -2,4 +2,5 @@
 /.venv
 __pycache__/
 *.pyc
-resultados
+repos
+META-INF

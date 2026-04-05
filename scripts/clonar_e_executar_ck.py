@@ -15,7 +15,11 @@ import shutil
 import os as os_exec
 import subprocess
 import shutil as shutil_exec
+import time
+import re
+from datetime import datetime, timezone
 from pathlib import Path
+import requests
 
 BASE_PROJETO = Path(__file__).resolve().parent.parent
 PASTA_RESULTADOS = BASE_PROJETO / "resultados"
@@ -26,8 +30,12 @@ SAIDA_SUMARIO = str(PASTA_CSVS / "resumo_metricas.csv")
 PASTA_SAIDA_CK = "saida_ck"
 ARQUIVO_CK_CLASSE = "class.csv"
 USAR_JARS_PADRAO = "false"
-MAX_ARQUIVOS_POR_PARTICAO = "0"
+MAX_ARQUIVOS_POR_PARTICAO = "100"
 IMPRIMIR_VARIAVEIS_E_CAMPOS = "false"
+ARQUIVO_FALHAS = str(PASTA_CSVS / "falhas.csv")
+
+TENTATIVAS_MAXIMAS = 5
+ESPERA_BASE_SEGUNDOS = 30
 
 
 def clonar_repositorio(nome_completo, destino):
@@ -114,16 +122,143 @@ def agregar_csv_ck(caminho_csv):
     }
 
 
-def escrever_resumo_saida(arquivo_saida, nome_repo, stats):
-    existe = Path(arquivo_saida).exists()
+def escrever_resumo_saida(arquivo_saida, linha):
+    caminho = Path(arquivo_saida)
+    fieldnames = [
+        "repositorio",
+        "estrelas",
+        "forks",
+        "criado_em",
+        "atualizado_em",
+        "idade_anos",
+        "releases",
+        "loc",
+        "comentarios",
+        "CBO_media",
+        "CBO_mediana",
+        "CBO_desvio",
+        "DIT_media",
+        "DIT_mediana",
+        "DIT_desvio",
+        "LCOM_media",
+        "LCOM_mediana",
+        "LCOM_desvio",
+    ]
+    repo = linha.get("repositorio")
+    if caminho.exists() and repo:
+        with open(caminho, newline='', encoding='utf-8') as f:
+            rows = list(csv.DictReader(f))
+        atualizado = False
+        for r in rows:
+            if r.get("repositorio") == repo:
+                for k in fieldnames:
+                    r[k] = linha.get(k, "")
+                atualizado = True
+                break
+        if atualizado:
+            with open(caminho, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for r in rows:
+                    writer.writerow({k: r.get(k, "") for k in fieldnames})
+            return
     with open(arquivo_saida, 'a', newline='', encoding='utf-8') as f:
-        fieldnames = ["repositorio","CBO_media","CBO_mediana","CBO_desvio","DIT_media","DIT_mediana","DIT_desvio","LCOM_media","LCOM_mediana","LCOM_desvio"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not caminho.exists() or caminho.stat().st_size == 0:
+            writer.writeheader()
+        writer.writerow({k: linha.get(k, "") for k in fieldnames})
+
+
+def escrever_falha(arquivo_falhas, nome_repo, motivo):
+    existe = Path(arquivo_falhas).exists()
+    with open(arquivo_falhas, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=["repositorio", "motivo"])
         if not existe:
             writer.writeheader()
-        linha = {"repositorio": nome_repo}
-        linha.update({k: stats.get(k, "") for k in fieldnames if k != "repositorio"})
-        writer.writerow(linha)
+        writer.writerow({"repositorio": nome_repo, "motivo": motivo})
+
+
+def calcular_idade_anos(criado_em_iso):
+    if not criado_em_iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(criado_em_iso.replace("Z", "+00:00"))
+    except Exception:
+        return ""
+    agora = datetime.now(timezone.utc)
+    return round((agora - dt).days / 365.25, 4)
+
+
+def normalizar_resumo(arquivo_saida):
+    caminho = Path(arquivo_saida)
+    if not caminho.exists():
+        return
+    campos_novos = [
+        "repositorio",
+        "estrelas",
+        "forks",
+        "criado_em",
+        "atualizado_em",
+        "idade_anos",
+        "releases",
+        "loc",
+        "comentarios",
+        "CBO_media",
+        "CBO_mediana",
+        "CBO_desvio",
+        "DIT_media",
+        "DIT_mediana",
+        "DIT_desvio",
+        "LCOM_media",
+        "LCOM_mediana",
+        "LCOM_desvio",
+    ]
+    campos_antigos = [
+        "repositorio",
+        "CBO_media",
+        "CBO_mediana",
+        "CBO_desvio",
+        "DIT_media",
+        "DIT_mediana",
+        "DIT_desvio",
+        "LCOM_media",
+        "LCOM_mediana",
+        "LCOM_desvio",
+    ]
+    linhas = caminho.read_text(encoding="utf-8").splitlines()
+    if not linhas:
+        return
+    dados = {}
+    for idx, linha in enumerate(linhas):
+        if idx == 0:
+            continue
+        partes = [p.strip() for p in linha.split(",")]
+        if len(partes) == len(campos_novos):
+            row = dict(zip(campos_novos, partes))
+        elif len(partes) == len(campos_antigos):
+            row = dict(zip(campos_antigos, partes))
+        else:
+            continue
+        repo = row.get("repositorio")
+        if not repo:
+            continue
+        if repo in dados:
+            atual = dados[repo]
+            def preenchidos(r):
+                return sum(1 for v in r.values() if v not in (None, ""))
+            if preenchidos(row) <= preenchidos(atual):
+                continue
+        dados[repo] = row
+    if not dados:
+        return
+    with open(caminho, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=campos_novos)
+        writer.writeheader()
+        for repo, row in dados.items():
+            writer.writerow({k: row.get(k, "") for k in campos_novos})
+
+
+
 
 
 def processar_repositorio(nome_repo, arquivo_saida=SAIDA_SUMARIO):
