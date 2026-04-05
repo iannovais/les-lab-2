@@ -258,16 +258,131 @@ def normalizar_resumo(arquivo_saida):
             writer.writerow({k: row.get(k, "") for k in campos_novos})
 
 
+def obter_total_releases(nome_repo, token=None):
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    tentativa = 0
+    url = f"https://api.github.com/repos/{nome_repo}/releases"
+    params = {"per_page": 1, "page": 1}
+    while True:
+        resp = requests.get(url, headers=headers, params=params)
+        if resp.status_code == 200:
+            break
+        if resp.status_code == 404:
+            return 0
+        if resp.status_code == 403 and tentativa < TENTATIVAS_MAXIMAS:
+            texto = resp.text.lower()
+            if "secondary rate limit" in texto or "rate limit exceeded" in texto:
+                espera = ESPERA_BASE_SEGUNDOS * (2 ** tentativa)
+                print(f"Rate limit detectado. Aguardando {espera}s e tentando novamente...")
+                time.sleep(espera)
+                tentativa += 1
+                continue
+        raise SystemExit(f"Erro na API do GitHub {resp.status_code}: {resp.text}")
+    itens = resp.json()
+    if not itens:
+        return 0
+    link = resp.headers.get("Link", "")
+    if 'rel="last"' in link:
+        m = re.search(r"[&?]page=(\d+)>; rel=\"last\"", link)
+        if m:
+            return int(m.group(1))
+    return len(itens)
 
 
+def contar_loc_comentarios(caminho_repo):
+    loc = 0
+    comentarios = 0
+    ignorar = {".git", "target", "build", "out", "node_modules"}
+    for raiz, dirs, arquivos in os.walk(caminho_repo):
+        dirs[:] = [d for d in dirs if d not in ignorar and not d.startswith(".")]
+        for nome in arquivos:
+            if not nome.endswith(".java"):
+                continue
+            caminho = Path(raiz) / nome
+            try:
+                with open(caminho, encoding="utf-8", errors="ignore") as f:
+                    in_block = False
+                    for linha in f:
+                        original = linha
+                        linha = linha.rstrip("\n")
+                        if not linha.strip() and not in_block:
+                            continue
+                        i = 0
+                        tem_codigo = False
+                        tem_comentario = False
+                        while i < len(linha):
+                            if in_block:
+                                fim = linha.find("*/", i)
+                                tem_comentario = True
+                                if fim == -1:
+                                    break
+                                i = fim + 2
+                                in_block = False
+                                continue
+                            pos_line = linha.find("//", i)
+                            pos_block = linha.find("/*", i)
+                            candidatos = [p for p in [pos_line, pos_block] if p != -1]
+                            if not candidatos:
+                                if linha[i:].strip():
+                                    tem_codigo = True
+                                break
+                            prox = min(candidatos)
+                            if linha[i:prox].strip():
+                                tem_codigo = True
+                            if prox == pos_line:
+                                tem_comentario = True
+                                break
+                            tem_comentario = True
+                            in_block = True
+                            i = prox + 2
+                        if tem_codigo:
+                            loc += 1
+                        if tem_comentario:
+                            comentarios += 1
+            except Exception:
+                continue
+    return loc, comentarios
 
-def processar_repositorio(nome_repo, arquivo_saida=SAIDA_SUMARIO):
-    """Clona, executa CK e grava o resumo para o repositório informado."""
+
+def processar_repositorio(nome_repo, info_repo=None, token=None, arquivo_saida=SAIDA_SUMARIO, manter_repo=True):
+    """Clona, executa CK e grava o resumo com metricas de processo e qualidade."""
     PASTA_REPOS.mkdir(parents=True, exist_ok=True)
     PASTA_CSVS.mkdir(parents=True, exist_ok=True)
     destino = PASTA_REPOS / nome_repo.replace('/', '_')
-    if destino.exists():
-        print(f"Removendo pasta existente {destino}")
+    if not destino.exists():
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Clonando {nome_repo} em {destino}")
+        clonar_repositorio(nome_repo, destino)
+    else:
+        print(f"Usando repo existente {destino}")
+
+    try:
+        csv_ck = executar_ck_no_caminho(destino)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Falha ao executar CK: {e}")
+
+    estat = agregar_csv_ck(csv_ck)
+    loc, comentarios = contar_loc_comentarios(destino)
+    releases = obter_total_releases(nome_repo, token=token)
+    info_repo = info_repo or {}
+    linha = {
+        "repositorio": nome_repo,
+        "estrelas": info_repo.get("estrelas", ""),
+        "forks": info_repo.get("forks", ""),
+        "criado_em": info_repo.get("criado_em", ""),
+        "atualizado_em": info_repo.get("atualizado_em", ""),
+        "idade_anos": calcular_idade_anos(info_repo.get("criado_em")),
+        "releases": releases,
+        "loc": loc,
+        "comentarios": comentarios,
+    }
+    linha.update(estat)
+    escrever_resumo_saida(arquivo_saida, linha)
+    print(f"Resumo gravado em {arquivo_saida}")
+
+    if not manter_repo:
         def _onerror(func, path, exc_info):
             try:
                 os_exec.chmod(path, 0o700)
@@ -275,25 +390,45 @@ def processar_repositorio(nome_repo, arquivo_saida=SAIDA_SUMARIO):
             except Exception:
                 pass
         shutil.rmtree(destino, onerror=_onerror)
-    destino.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Clonando {nome_repo} em {destino}")
-    clonar_repositorio(nome_repo, destino)
-
-    try:
-        csv_ck = executar_ck_no_caminho(destino)
-    except subprocess.CalledProcessError as e:
-        raise SystemExit(f"Falha ao executar CK: {e}")
-
-    estat = agregar_csv_ck(csv_ck)
-    escrever_resumo_saida(arquivo_saida, nome_repo, estat)
-    print(f"Resumo gravado em {arquivo_saida}")
 
 
-def processar_repositorio_por_csv(caminho_csv, index=0, arquivo_saida=SAIDA_SUMARIO):
-    """Lê o CSV (coluna `nome_completo`) e processa o repositório no índice fornecido."""
+def processar_repositorio_por_csv(caminho_csv, index=0, arquivo_saida=SAIDA_SUMARIO, token=None, manter_repo=True):
+    """Le o CSV (coluna `nome_completo`) e processa o repositorio no indice fornecido."""
     with open(caminho_csv, newline='', encoding='utf-8') as f:
         reader = list(csv.DictReader(f))
         if index < 0 or index >= len(reader):
-            raise SystemExit("Índice fora do intervalo no CSV")
-        nome_repo = reader[index]["nome_completo"]
-    processar_repositorio(nome_repo, arquivo_saida=arquivo_saida)
+            raise SystemExit("Indice fora do intervalo no CSV")
+        info_repo = reader[index]
+        nome_repo = info_repo["nome_completo"]
+    processar_repositorio(nome_repo, info_repo=info_repo, token=token, arquivo_saida=arquivo_saida, manter_repo=manter_repo)
+
+
+def carregar_resumo_existente(arquivo_saida):
+    normalizar_resumo(arquivo_saida)
+    if not Path(arquivo_saida).exists():
+        return set()
+    with open(arquivo_saida, newline='', encoding='utf-8') as f:
+        return {r.get("repositorio") for r in csv.DictReader(f) if r.get("repositorio")}
+
+
+def processar_repositorios_em_lote(caminho_csv, inicio=0, fim=None, arquivo_saida=SAIDA_SUMARIO, token=None, manter_repo=True, pular_existentes=True, arquivo_falhas=ARQUIVO_FALHAS):
+    """Processa varios repositorios listados no CSV."""
+    with open(caminho_csv, newline='', encoding='utf-8') as f:
+        repos = list(csv.DictReader(f))
+    if fim is None or fim > len(repos):
+        fim = len(repos)
+    existentes = carregar_resumo_existente(arquivo_saida) if pular_existentes else set()
+    for i in range(inicio, fim):
+        info_repo = repos[i]
+        nome_repo = info_repo.get("nome_completo")
+        if not nome_repo:
+            continue
+        if nome_repo in existentes:
+            print(f"Pulando {nome_repo} (ja processado)")
+            continue
+        try:
+            print(f"Processando {i - inicio + 1}/{fim - inicio}: {nome_repo}")
+            processar_repositorio(nome_repo, info_repo=info_repo, token=token, arquivo_saida=arquivo_saida, manter_repo=manter_repo)
+        except Exception as e:
+            print(f"Falha ao processar {nome_repo}: {e}")
+            escrever_falha(arquivo_falhas, nome_repo, str(e))
