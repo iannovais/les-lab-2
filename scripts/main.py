@@ -12,7 +12,7 @@ import os
 import argparse
 from pathlib import Path
 from buscar_repos_java import buscar_repos_java
-from clonar_e_executar_ck import processar_repositorio_por_csv
+from clonar_e_executar_ck import processar_repositorio_por_csv, processar_repositorios_em_lote
 
 BASE_PROJETO = Path(__file__).resolve().parent.parent
 ARQUIVO_ENV = BASE_PROJETO / '.env'
@@ -40,7 +40,12 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--saida-lista', default=str(PASTA_CSVS / 'lista_repos_java.csv'))
     p.add_argument('--max', type=int, default=1000)
-    p.add_argument('--index', type=int, default=0, help='índice (0-based) do repositório para medir')
+    p.add_argument('--index', type=int, default=0, help='indice (0-based) do repositorio para medir')
+    p.add_argument('--lote', action='store_true', help='processar varios repositorios em sequencia')
+    p.add_argument('--inicio', type=int, default=0, help='indice inicial (0-based) do lote')
+    p.add_argument('--fim', type=int, default=None, help='indice final (exclusivo) do lote')
+    p.add_argument('--reprocessar', action='store_true', help='reprocessar repos ja medidos no resumo')
+    p.add_argument('--limpar-repos', action='store_true', help='remover repos clonados apos o processamento')
     p.add_argument('--forcar-lista', action='store_true', help='forçar nova coleta da lista de repositórios')
     args = p.parse_args()
 
@@ -62,9 +67,22 @@ def main():
     else:
         print('Usando lista existente de repositórios Java...')
 
-    # clonar e executar CK no índice selecionado
-    print(f'Processando repositório no índice {args.index}...')
-    processar_repositorio_por_csv(args.saida_lista, index=args.index)
+    manter_repo = not args.limpar_repos
+    modo_lote = args.lote or (args.inicio == 0 and args.fim is None and args.index == 0)
+    if modo_lote:
+        print(f'Processando repositorios em lote ({args.inicio} ate {args.fim})...')
+        processar_repositorios_em_lote(
+            args.saida_lista,
+            inicio=args.inicio,
+            fim=args.fim,
+            token=token,
+            manter_repo=manter_repo,
+            pular_existentes=not args.reprocessar,
+        )
+    else:
+        # clonar e executar CK no indice selecionado
+        print(f'Processando repositorio no indice {args.index}...')
+        processar_repositorio_por_csv(args.saida_lista, index=args.index, token=token, manter_repo=manter_repo)
 
     print('Execução completa. Verifique resumo_metricas.csv')
 
